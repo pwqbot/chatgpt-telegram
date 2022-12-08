@@ -40,7 +40,7 @@ func Sendmsg_(
 }
 
 func debouncedType(chatId int64, bot *tgbotapi.BotAPI) func() {
-	return ratelimit.Debounce((10 * time.Second), func() {
+	return ratelimit.Debounce((1 * time.Second), func() {
 		bot.Request(tgbotapi.NewChatAction(chatId, "typing"))
 	})
 }
@@ -84,11 +84,8 @@ func ReplyToChat(
 	var message tgbotapi.Message
 
 	debounceE := debouncedEdit(message.MessageID, msgConfig, bot)
-	deboundT := debouncedType(msgConfig.ChatID, bot)
 
-	deboundT()
 	for response := range feed {
-		deboundT()
 		log.Print(response.Message)
 		userConversations[msgConfig.ChatID] = Conversation{
 			LastMessageID:  response.MessageId,
@@ -96,13 +93,13 @@ func ReplyToChat(
 		}
 		lastResp = markdown.EnsureFormatting(response.Message)
 		msgConfig.Text = lastResp
-		if msgConfig.Text == "" {
-			msgConfig.Text = " "
+		if msgConfig.Text == "``" {
+			msgConfig.Text = "`...`"
 		}
 
 		if message.MessageID == 0 {
 			var err error
-			
+
 			message, err = bot.Send(msgConfig)
 			log.Print(msgConfig)
 			log.Print("Send first")
@@ -113,6 +110,7 @@ func ReplyToChat(
 			log.Print("send edit")
 			debounceE(message.MessageID, lastResp)
 		}
+
 	}
 
 	_, err := bot.Request(tgbotapi.EditMessageTextConfig{
@@ -142,11 +140,27 @@ func ProcessOneInput(
 	userConversations map[int64]Conversation,
 	bot *tgbotapi.BotAPI,
 ) (tgbotapi.MessageConfig, error) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	debounceT := debouncedType(msgConfig.ChatID, bot)
+
+	//
+
+	go func() {
+		for range ticker.C {
+			debounceT()
+		}
+	}()
+
 	feed, err := chatGPT.SendMessage(input,
 		userConversations[msgConfig.ChatID].ConversationID,
 		userConversations[msgConfig.ChatID].LastMessageID,
 	)
+
 	if err != nil {
+		log.Print("Couldn't send message to chatgpt: ", err)
+		msgConfig.Text = "Couldn't send message to chatgpt: " + err.Error()
+		_, err := bot.Send(msgConfig)
 		return msgConfig, err
 	}
 
