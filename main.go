@@ -1,27 +1,23 @@
 package main
 
 import (
-	"fmt"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
-	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 	"github.com/m1guelpf/chatgpt-telegram/src/chatgpt"
 	"github.com/m1guelpf/chatgpt-telegram/src/config"
-	"github.com/m1guelpf/chatgpt-telegram/src/markdown"
-	"github.com/m1guelpf/chatgpt-telegram/src/ratelimit"
+	"github.com/m1guelpf/chatgpt-telegram/src/prompts"
+	"github.com/m1guelpf/chatgpt-telegram/src/sendmsg"
 	"github.com/m1guelpf/chatgpt-telegram/src/session"
 )
-
-type Conversation struct {
-	ConversationID string
-	LastMessageID  string
-}
 
 func main() {
 	config, err := config.Init()
@@ -49,9 +45,21 @@ func main() {
 		log.Fatalf("Couldn't load .env file: %v", err)
 	}
 
-	bot, err := tgbotapi.NewBotAPI(os.Getenv("TELEGRAM_TOKEN"))
+	const proxyUrl = "http://172.31.176.1:10809"
+	proxyUri, err := url.Parse(proxyUrl)
 	if err != nil {
-		log.Fatalf("Couldn't start Telegram bot: %v", err)
+		log.Panic(err)
+	}
+
+	const APIEndpoint = "https://api.telegram.org/bot%s/%s"
+	bot, err := tgbotapi.NewBotAPIWithClient(os.Getenv("TELEGRAM_TOKEN"),
+		APIEndpoint,
+		&http.Client{Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyUri),
+		}})
+
+	if err != nil {
+		log.Panic(err)
 	}
 
 	c := make(chan os.Signal, 2)
@@ -66,14 +74,26 @@ func main() {
 	updateConfig.Timeout = 30
 	updates := bot.GetUpdatesChan(updateConfig)
 
-	log.Printf("Started Telegram bot! Message @%s to start.", bot.Self.UserName)
+	log.Printf("Started Telegram bot! Message @%s to start. %s, %s",
+		bot.Self.UserName, bot.Self.FirstName, bot.Self.LastName)
 
-	userConversations := make(map[int64]Conversation)
+	userConversations := make(map[int64]sendmsg.Conversation)
 
 	for update := range updates {
 		if update.Message == nil {
 			continue
 		}
+		userInput := update.Message.Text
+		if !update.Message.IsCommand() &&
+			update.Message.Chat.IsGroup() {
+			if !strings.HasPrefix(userInput,
+				bot.Self.FirstName) {
+				continue
+			}
+			userInput = userInput[2:]
+		}
+
+		log.Print(userInput)
 
 		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "")
 		msg.ReplyToMessageID = update.Message.MessageID
@@ -86,85 +106,22 @@ func main() {
 			continue
 		}
 
-		bot.Request(tgbotapi.NewChatAction(update.Message.Chat.ID, "typing"))
 		if !update.Message.IsCommand() {
-			feed, err := chatGPT.SendMessage(update.Message.Text, userConversations[update.Message.Chat.ID].ConversationID, userConversations[update.Message.Chat.ID].LastMessageID)
+			msg, err = sendmsg.ProcessOneInput(
+				userInput,
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
 			if err != nil {
-				msg.Text = fmt.Sprintf("Error: %v", err)
+				log.Print(err)
 			}
-
-			var message tgbotapi.Message
-			var lastResp string
-
-			debouncedType := ratelimit.Debounce((10 * time.Second), func() {
-				bot.Request(tgbotapi.NewChatAction(update.Message.Chat.ID, "typing"))
-			})
-			debouncedEdit := ratelimit.DebounceWithArgs((1 * time.Second), func(text interface{}, messageId interface{}) {
-				_, err = bot.Request(tgbotapi.EditMessageTextConfig{
-					BaseEdit: tgbotapi.BaseEdit{
-						ChatID:    msg.ChatID,
-						MessageID: messageId.(int),
-					},
-					Text:      text.(string),
-					ParseMode: "Markdown",
-				})
-
-				if err != nil {
-					if err.Error() == "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message" {
-						return
-					}
-
-					log.Printf("Couldn't edit message: %v", err)
-				}
-			})
-
-		pollResponse:
-			for {
-				debouncedType()
-
-				select {
-				case response, ok := <-feed:
-					if !ok {
-						break pollResponse
-					}
-
-					userConversations[update.Message.Chat.ID] = Conversation{
-						LastMessageID:  response.MessageId,
-						ConversationID: response.ConversationId,
-					}
-					lastResp = markdown.EnsureFormatting(response.Message)
-					msg.Text = lastResp
-
-					if message.MessageID == 0 {
-						message, err = bot.Send(msg)
-						if err != nil {
-							log.Fatalf("Couldn't send message: %v", err)
-						}
-					} else {
-						debouncedEdit(lastResp, message.MessageID)
-					}
-				}
-			}
-
-			_, err = bot.Request(tgbotapi.EditMessageTextConfig{
-				BaseEdit: tgbotapi.BaseEdit{
-					ChatID:    msg.ChatID,
-					MessageID: message.MessageID,
-				},
-				Text:      lastResp,
-				ParseMode: "Markdown",
-			})
-
-			if err != nil {
-				if err.Error() == "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message" {
-					continue
-				}
-
-				log.Printf("Couldn't perform final edit on message: %v", err)
-			}
-
 			continue
 		}
+		args := update.Message.CommandArguments()
+		log.Print(args)
+		log.Print(update.Message.Command())
 
 		switch update.Message.Command() {
 		case "help":
@@ -172,9 +129,171 @@ func main() {
 		case "start":
 			msg.Text = "Send a message to start talking with ChatGPT. You can use /reload at any point to clear the conversation history and start from scratch (don't worry, it won't delete the Telegram messages)."
 		case "reload":
-			userConversations[update.Message.Chat.ID] = Conversation{}
+			userConversations[update.Message.Chat.ID] = sendmsg.Conversation{}
 			msg.Text = "Started a new conversation. Enjoy!"
+		case "travel":
+			_, err := sendmsg.ProcessOneInput(
+				prompts.TravelGuide,
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "terminal":
+			_, err := sendmsg.ProcessOneInput(
+				prompts.LinuxTerminal(args),
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "xjp":
+			_, err := sendmsg.ProcessOneInput(
+				prompts.XiJinPing,
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "jzm":
+			_, err := sendmsg.ProcessOneInput(
+				prompts.JiangZeMing,
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "catgirl":
+			_, err := sendmsg.ProcessOneInput(
+				prompts.CatGirl,
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "act":
+			log.Print("act")
+			_, err := sendmsg.ProcessOneInput(
+				prompts.Charactor(args),
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "animal":
+			log.Print("animal")
+			_, err := sendmsg.ProcessOneInput(
+				prompts.Animal(args),
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "turing":
+			log.Print("turing")
+			_, err := sendmsg.ProcessOneInput(
+				prompts.TuringTest,
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "doctor":
+			_, err := sendmsg.ProcessOneInput(
+				prompts.Doctor,
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+
+		case "rap":
+			_, err := sendmsg.ProcessOneInput(
+				prompts.Rapper,
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "baba":
+			_, err := sendmsg.ProcessOneInput(
+				prompts.Baba,
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "role":
+			_, err := sendmsg.ProcessOneInput(
+				prompts.Role(args),
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+		case "pokemon":
+			_, err := sendmsg.ProcessOneInput(
+				prompts.Pokemon,
+				&chatGPT,
+				msg,
+				userConversations,
+				bot,
+			)
+			if err != nil {
+				log.Print(err)
+			}
+			continue
+
 		default:
+			log.Print("bb Done")
 			continue
 		}
 
